@@ -91,83 +91,105 @@ __attribute__((constructor)) static void RTBootstrap(void) {
 }
 // Route through the *original* Rutube navigation targets. Their Swift views often
 // use tap recognizers rather than UIKit UIControl target/action events.
-- (BOOL)dispatchRecognizer:(UIGestureRecognizer *)gesture {
-    if (!gesture.enabled || ![gesture isKindOfClass:UITapGestureRecognizer.class]) return NO;
-    @try {
-        NSArray *targets=[gesture valueForKey:@"_targets"];
-        if (![targets isKindOfClass:NSArray.class]) return NO;
-        for (id info in targets) {
-            Ivar ti=class_getInstanceVariable([info class], "_target");
-            Ivar ai=class_getInstanceVariable([info class], "_action");
-            if (!ti || !ai || strcmp(ivar_getTypeEncoding(ai),":")!=0) continue;
-            id target=object_getIvar(info,ti);
-            SEL action=*((SEL *)((uint8_t *)(__bridge void *)info+ivar_getOffset(ai)));
-            if (target && action && [target respondsToSelector:action]) {
-                [UIApplication.sharedApplication sendAction:action to:target from:gesture forEvent:nil];
-                return YES;
+// These selectors are the original methods from Rutube 47.15.0 dSYM:
+ // _$s6Rutube25NavigationBarItemsManagerC10openSearchyyFTo
+ // _$s6Rutube25NavigationBarItemsManagerC21openNotificationsPageyyFTo
+ // _$s6Rutube25NavigationBarItemsManagerC11openProfileyyFTo
+ // Never assume icon order or synthesize touch events.
+- (void)checkBarItem:(UIBarButtonItem *)item forSelector:(SEL)selector found:(id __strong *)found {
+    if (*found || !item) return;
+    id target=item.target;
+    Class manager=NSClassFromString(@"Rutube.NavigationBarItemsManager");
+    if (manager && target && [target isKindOfClass:manager] &&
+        [target respondsToSelector:selector]) {
+        *found=target;
+        return;
+    }
+    if (!item.customView) return;
+    [self walk:item.customView with:^(UIView *view) {
+        if (*found || ![view isKindOfClass:UIControl.class]) return;
+        UIControl *c=(UIControl *)view;
+        for (id candidate in c.allTargets) {
+            if (manager && [candidate isKindOfClass:manager] &&
+                [candidate respondsToSelector:selector]) {
+                *found=candidate;
+                break;
             }
         }
-    } @catch (__unused NSException *exception) {}
-    return NO;
+    }];
 }
-- (BOOL)triggerOriginalView:(UIView *)view {
-    if (!view) return NO;
-    // Prefer the native button, retaining its own target and event semantics.
-    if ([view isKindOfClass:UIControl.class]) {
-        UIControl *control=(UIControl *)view;
-        if (control.enabled &&
-            ([control actionsForTarget:nil forControlEvent:UIControlEventTouchUpInside].count ||
-             control.allTargets.count || control.primaryAction)) {
-            [control sendActionsForControlEvents:UIControlEventTouchUpInside];
-            [control sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
-            return YES;
+- (id)originalManagerFor:(SEL)selector {
+    __block id found=nil;
+    UIWindow *window=self.window;
+    if (!window || !NSClassFromString(@"Rutube.NavigationBarItemsManager")) return nil;
+    // Inspect all original UIKit navigation items, including controller instances.
+    [self walk:window with:^(UIView *view) {
+        if (found || ![view isKindOfClass:UINavigationBar.class]) return;
+        UINavigationBar *bar=(UINavigationBar *)view;
+        for (UINavigationItem *navItem in bar.items) {
+            for (UIBarButtonItem *item in navItem.rightBarButtonItems)
+                [self checkBarItem:item forSelector:selector found:&found];
+            for (UIBarButtonItem *item in navItem.leftBarButtonItems)
+                [self checkBarItem:item forSelector:selector found:&found];
         }
+    }];
+    if (found) return found;
+    NSMutableArray<UIViewController *> *pending=[NSMutableArray array];
+    if (window.rootViewController) [pending addObject:window.rootViewController];
+    NSMutableSet<NSValue *> *seen=[NSMutableSet set];
+    while (pending.count && !found) {
+        UIViewController *vc=pending.lastObject;
+        [pending removeLastObject];
+        NSValue *key=[NSValue valueWithNonretainedObject:vc];
+        if ([seen containsObject:key]) continue;
+        [seen addObject:key];
+        for (UIBarButtonItem *item in vc.navigationItem.rightBarButtonItems)
+            [self checkBarItem:item forSelector:selector found:&found];
+        for (UIBarButtonItem *item in vc.navigationItem.leftBarButtonItems)
+            [self checkBarItem:item forSelector:selector found:&found];
+        if (vc.presentedViewController) [pending addObject:vc.presentedViewController];
+        if ([vc isKindOfClass:UINavigationController.class]) {
+            UINavigationController *nav=(UINavigationController *)vc;
+            [pending addObjectsFromArray:nav.viewControllers];
+        }
+        [pending addObjectsFromArray:vc.childViewControllers];
     }
-    for (UIView *child in view.subviews)
-        if ([self triggerOriginalView:child]) return YES;
-    for (UIGestureRecognizer *gr in view.gestureRecognizers)
-        if ([self dispatchRecognizer:gr]) return YES;
-    return NO;
+    if (found) return found;
+    // Original custom top buttons may be implemented as UIControls.
+    [self walk:window with:^(UIView *view) {
+        if (found || ![view isKindOfClass:UIControl.class]) return;
+        if (self.header && [view isDescendantOfView:self.header]) return;
+        if (self.footer && [view isDescendantOfView:self.footer]) return;
+        for (id target in ((UIControl *)view).allTargets) {
+            Class manager=NSClassFromString(@"Rutube.NavigationBarItemsManager");
+            if (manager && [target isKindOfClass:manager] && [target respondsToSelector:selector]) {
+                found=target; break;
+            }
+        }
+    }];
+    return found;
 }
-- (BOOL)activateBarItem:(UIBarButtonItem *)item {
-    if (!item) return NO;
-    if (item.target && item.action && [item.target respondsToSelector:item.action]) {
-        [UIApplication.sharedApplication sendAction:item.action to:item.target from:item forEvent:nil];
-        return YES;
+- (BOOL)routeOriginalSelector:(SEL)selector {
+    id manager=[self originalManagerFor:selector];
+    if (!manager) {
+        NSLog(@"[RTUIFix] Exact native action %@ not found; cannot route safely",NSStringFromSelector(selector));
+        return NO;
     }
-    if (item.customView) return [self triggerOriginalView:item.customView];
-    return NO;
-}
-- (BOOL)routeOriginal:(NSString *)route {
-    if ([route isEqualToString:@"search"]) {
-        if ([self triggerOriginalView:self.nativeSearchView] ||
-            [self triggerOriginalView:self.searchControl]) return YES;
-        if (self.rightNavItems.count>=3)
-            return [self activateBarItem:self.rightNavItems[1]];
-    } else if ([route isEqualToString:@"notifications"]) {
-        if ([self triggerOriginalView:self.nativeNotificationsView] ||
-            [self triggerOriginalView:self.notificationControl]) return YES;
-        if (self.rightNavItems.count>=3)
-            return [self activateBarItem:self.rightNavItems[2]];
-    } else if ([route isEqualToString:@"profile"]) {
-        if ([self triggerOriginalView:self.nativeProfileView] ||
-            [self triggerOriginalView:self.profileControl]) return YES;
-        if (self.rightNavItems.count>=3)
-            return [self activateBarItem:self.rightNavItems[0]];
-    }
-    NSLog(@"[RTUIFix] Original %@ action unavailable. Original UI remains intact.",route);
-    return NO;
+    // Dispatch the *original* ObjC-visible Swift selector on the existing
+    // NavigationBarItemsManager, not on a synthetic proxy or a new instance.
+    BOOL sent=[UIApplication.sharedApplication sendAction:selector
+                           to:manager from:self forEvent:nil];
+    NSLog(@"[RTUIFix] %@ -> %@",NSStringFromSelector(selector),sent?@"sent":@"failed");
+    return sent;
 }
 - (void)tapSearch {
-    [self routeOriginal:@"search"];
-    [self schedule];
+    [self routeOriginalSelector:@selector(openSearch)];
 }
 - (void)tapNotifications {
-    [self routeOriginal:@"notifications"];
-    [self schedule];
+    [self routeOriginalSelector:@selector(openNotificationsPage)];
 }
 - (void)tapProfile {
-    if (![self routeOriginal:@"profile"]) [self activate:4];
+    if (![self routeOriginalSelector:@selector(openProfile)]) [self activate:4];
 }
 - (void)tapHome { [self activate:0]; }
 - (void)tapUpload { [self activate:2]; }
@@ -383,6 +405,16 @@ __attribute__((constructor)) static void RTBootstrap(void) {
         return;
     }
     [self captureOriginalHeader];
+    // Fail closed: do not replace the native controls unless their original
+    // handlers exist. Avoid ever shipping a beautiful but dead tab bar.
+    if (![self originalManagerFor:@selector(openSearch)] ||
+        ![self originalManagerFor:@selector(openNotificationsPage)]) {
+        NSLog(@"[RTUIFix] Native search/notifications handler inaccessible; keeping unmodified UI");
+        self.header.hidden=YES;
+        self.footer.hidden=YES;
+        self.subscriptions.hidden=YES;
+        return;
+    }
     [self drawHeader];
     [self drawFooter:native];
     [self drawSubscriptions];
