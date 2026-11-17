@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build:
@@ -16,14 +17,23 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Get official Rutube iOS distribution
+      - name: Reuse verified original Rutube 47.15 base from previous successful build
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 \
-            'https://promo.rutubelist.ru/distr/rutube_ios_package_2026.zip' \
-            -o original-rutube-ios.zip
-          echo 'cb2d56eda602aaa602af8e0f343a64c98d5d1fa4c0242880751d04aa3d1e9afb  original-rutube-ios.zip' | shasum -a 256 --check
-          python3 scripts/prepare_base.py original-rutube-ios.zip original-rutube.ipa
+          mkdir -p source-ipa
+          gh run download 44167893634 --repo "${{ github.repository }}" --name Rutube-iOS-IPA-unsigned --dir source-ipa
+          cp source-ipa/Rutube.ipa original-rutube.ipa
+          python3 - <<'PY'
+          import zipfile,hashlib
+          with zipfile.ZipFile("original-rutube.ipa") as z:
+              assert z.testzip() is None
+              b=z.read("Payload/Rutube.app/Rutube")
+              assert len(b)>20_000_000
+              assert b'@executable_path/Frameworks/RTUIFix.framework/RTUIFix' in b[:0x4000]
+              print("Verified original app executable for module replacement, SHA256:",hashlib.sha256(b).hexdigest())
+          PY
 
       - name: Compile native UI module (iPhone arm64)
         run: |
