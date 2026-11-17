@@ -1,0 +1,66 @@
+name: Rutube iOS IPA build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Compile and embed Rutube UI Mod
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Get official Rutube iOS distribution
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 \
+            'https://promo.rutubelist.ru/distr/rutube_ios_package_2026.zip' \
+            -o original-rutube-ios.zip
+          echo 'cb2d56eda602aaa602af8e0f343a64c98d5d1fa4c0242880751d04aa3d1e9afb  original-rutube-ios.zip' | shasum -a 256 --check
+          python3 scripts/prepare_base.py original-rutube-ios.zip original-rutube.ipa
+
+      - name: Compile native UI module (iPhone arm64)
+        run: |
+          xcodebuild -version
+          bash scripts/compile_ios_framework.sh
+
+      - name: Embed framework and set app name Rutube
+        run: |
+          python3 scripts/integrate.py \
+            --base original-rutube.ipa \
+            --framework build/RTUIFix.framework \
+            --output Rutube.ipa
+
+      - name: Verify output IPA
+        run: |
+          python3 - <<'PY'
+          import zipfile,plistlib,struct
+          p='Rutube.ipa'
+          with zipfile.ZipFile(p) as z:
+              assert z.testzip() is None
+              names=z.namelist()
+              app='Payload/Rutube.app/'
+              assert app+'Frameworks/RTUIFix.framework/RTUIFix' in names
+              props=plistlib.loads(z.read(app+'Info.plist'))
+              assert props['CFBundleDisplayName']=='Rutube'
+              assert props['CFBundleName']=='Rutube'
+              binary=z.read(app+'Rutube')
+              assert struct.unpack_from('<I',binary)[0]==0xfeedfacf
+              assert b'@executable_path/Frameworks/RTUIFix.framework/RTUIFix' in binary[:0x4000]
+              print('PASS: arm64 iOS IPA, app name Rutube, embedded UI framework')
+              print('NOTE: unsigned, must sign app/framework/extensions to install')
+          PY
+
+      - name: Upload unsigned Rutube IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rutube-iOS-IPA-unsigned
+          path: Rutube.ipa
+          if-no-files-found: error
+          retention-days: 14
