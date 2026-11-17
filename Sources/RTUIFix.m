@@ -3,6 +3,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 
 @interface RTUIFix : NSObject
 @property (nonatomic,strong) UIView *header;
@@ -91,95 +93,54 @@ __attribute__((constructor)) static void RTBootstrap(void) {
 }
 // Route through the *original* Rutube navigation targets. Their Swift views often
 // use tap recognizers rather than UIKit UIControl target/action events.
-// These selectors are the original methods from Rutube 47.15.0 dSYM:
- // _$s6Rutube25NavigationBarItemsManagerC10openSearchyyFTo
- // _$s6Rutube25NavigationBarItemsManagerC21openNotificationsPageyyFTo
- // _$s6Rutube25NavigationBarItemsManagerC11openProfileyyFTo
- // Never assume icon order or synthesize touch events.
-- (void)checkBarItem:(UIBarButtonItem *)item forSelector:(SEL)selector found:(id __strong *)found {
-    if (*found || !item) return;
-    id target=item.target;
-    Class manager=NSClassFromString(@"Rutube.NavigationBarItemsManager");
-    if (manager && target && [target isKindOfClass:manager] &&
-        [target respondsToSelector:selector]) {
-        *found=target;
-        return;
-    }
-    if (!item.customView) return;
-    [self walk:item.customView with:^(UIView *view) {
-        if (*found || ![view isKindOfClass:UIControl.class]) return;
-        UIControl *c=(UIControl *)view;
-        for (id candidate in c.allTargets) {
-            if (manager && [candidate isKindOfClass:manager] &&
-                [candidate respondsToSelector:selector]) {
-                *found=candidate;
-                break;
-            }
+// Verified against original Rutube 47.15.0 development binary and dSYM.
+// Swift static getter _$s6Rutube25NavigationBarItemsManagerC6shared_WZ:
+// original unslid virtual address 0x1001CB728, returns the retained singleton
+// as a Swift/ObjC object pointer in x0 (ARM64).
+// ObjC thunks in the same executable dispatch selectors openSearch,
+// openNotificationsPage and openProfile.
+#define RT_NAV_MANAGER_SHARED_VMADDR ((uintptr_t)0x1001CB728)
+- (id)originalNavigationManager {
+    static id manager=nil;
+    static dispatch_once_t token;
+    dispatch_once(&token,^{
+        const struct mach_header *h=_dyld_get_image_header(0);
+        if (!h || h->magic!=MH_MAGIC_64 || h->filetype!=MH_EXECUTE ||
+            h->cputype!=CPU_TYPE_ARM64) {
+            NSLog(@"[RTUIFix] Unexpected executable header; cannot resolve Swift singleton");
+            return;
         }
-    }];
-}
-- (id)originalManagerFor:(SEL)selector {
-    __block id found=nil;
-    UIWindow *window=self.window;
-    if (!window || !NSClassFromString(@"Rutube.NavigationBarItemsManager")) return nil;
-    // Inspect all original UIKit navigation items, including controller instances.
-    [self walk:window with:^(UIView *view) {
-        if (found || ![view isKindOfClass:UINavigationBar.class]) return;
-        UINavigationBar *bar=(UINavigationBar *)view;
-        for (UINavigationItem *navItem in bar.items) {
-            for (UIBarButtonItem *item in navItem.rightBarButtonItems)
-                [self checkBarItem:item forSelector:selector found:&found];
-            for (UIBarButtonItem *item in navItem.leftBarButtonItems)
-                [self checkBarItem:item forSelector:selector found:&found];
+        const char *binary=_dyld_get_image_name(0);
+        if (!binary || !strstr(binary,"/Rutube.app/Rutube")) {
+            NSLog(@"[RTUIFix] Unknown main executable; fail closed");
+            return;
         }
-    }];
-    if (found) return found;
-    NSMutableArray<UIViewController *> *pending=[NSMutableArray array];
-    if (window.rootViewController) [pending addObject:window.rootViewController];
-    NSMutableSet<NSValue *> *seen=[NSMutableSet set];
-    while (pending.count && !found) {
-        UIViewController *vc=pending.lastObject;
-        [pending removeLastObject];
-        NSValue *key=[NSValue valueWithNonretainedObject:vc];
-        if ([seen containsObject:key]) continue;
-        [seen addObject:key];
-        for (UIBarButtonItem *item in vc.navigationItem.rightBarButtonItems)
-            [self checkBarItem:item forSelector:selector found:&found];
-        for (UIBarButtonItem *item in vc.navigationItem.leftBarButtonItems)
-            [self checkBarItem:item forSelector:selector found:&found];
-        if (vc.presentedViewController) [pending addObject:vc.presentedViewController];
-        if ([vc isKindOfClass:UINavigationController.class]) {
-            UINavigationController *nav=(UINavigationController *)vc;
-            [pending addObjectsFromArray:nav.viewControllers];
+        intptr_t slide=_dyld_get_image_vmaddr_slide(0);
+        uintptr_t entry=RT_NAV_MANAGER_SHARED_VMADDR+(uintptr_t)slide;
+        // The address is build-specific, protected by a matching archive hash
+        // in GitHub Actions. Never use it with another Rutube binary.
+        id (*swiftSharedGetter)(void)=(id(*)(void))entry;
+        id instance=swiftSharedGetter();
+        if (instance && [instance respondsToSelector:@selector(openSearch)] &&
+            [instance respondsToSelector:@selector(openNotificationsPage)]) {
+            manager=instance;
+            NSLog(@"[RTUIFix] Connected to original NavigationBarItemsManager.shared: %@",manager);
+        } else {
+            NSLog(@"[RTUIFix] Original NavigationBarItemsManager singleton has unexpected selectors");
         }
-        [pending addObjectsFromArray:vc.childViewControllers];
-    }
-    if (found) return found;
-    // Original custom top buttons may be implemented as UIControls.
-    [self walk:window with:^(UIView *view) {
-        if (found || ![view isKindOfClass:UIControl.class]) return;
-        if (self.header && [view isDescendantOfView:self.header]) return;
-        if (self.footer && [view isDescendantOfView:self.footer]) return;
-        for (id target in ((UIControl *)view).allTargets) {
-            Class manager=NSClassFromString(@"Rutube.NavigationBarItemsManager");
-            if (manager && [target isKindOfClass:manager] && [target respondsToSelector:selector]) {
-                found=target; break;
-            }
-        }
-    }];
-    return found;
+    });
+    return manager;
 }
 - (BOOL)routeOriginalSelector:(SEL)selector {
-    id manager=[self originalManagerFor:selector];
-    if (!manager) {
-        NSLog(@"[RTUIFix] Exact native action %@ not found; cannot route safely",NSStringFromSelector(selector));
+    id manager=[self originalNavigationManager];
+    if (!manager || ![manager respondsToSelector:selector]) {
+        NSLog(@"[RTUIFix] Original selector unavailable: %@",NSStringFromSelector(selector));
         return NO;
     }
-    // Dispatch the *original* ObjC-visible Swift selector on the existing
-    // NavigationBarItemsManager, not on a synthetic proxy or a new instance.
     BOOL sent=[UIApplication.sharedApplication sendAction:selector
-                           to:manager from:self forEvent:nil];
-    NSLog(@"[RTUIFix] %@ -> %@",NSStringFromSelector(selector),sent?@"sent":@"failed");
+                                     to:manager from:self forEvent:nil];
+    NSLog(@"[RTUIFix] Native %@ %@",NSStringFromSelector(selector),
+          sent?@"invoked":@"FAILED");
     return sent;
 }
 - (void)tapSearch {
@@ -407,8 +368,10 @@ __attribute__((constructor)) static void RTBootstrap(void) {
     [self captureOriginalHeader];
     // Fail closed: do not replace the native controls unless their original
     // handlers exist. Avoid ever shipping a beautiful but dead tab bar.
-    if (![self originalManagerFor:@selector(openSearch)] ||
-        ![self originalManagerFor:@selector(openNotificationsPage)]) {
+    id originalManager=[self originalNavigationManager];
+    if (!originalManager ||
+        ![originalManager respondsToSelector:@selector(openSearch)] ||
+        ![originalManager respondsToSelector:@selector(openNotificationsPage)]) {
         NSLog(@"[RTUIFix] Native search/notifications handler inaccessible; keeping unmodified UI");
         self.header.hidden=YES;
         self.footer.hidden=YES;
