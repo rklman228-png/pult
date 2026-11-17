@@ -2,6 +2,7 @@
 // The underlying Rutube controllers, account, player and network logic remain untouched.
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 @interface RTUIFix : NSObject
 @property (nonatomic,strong) UIView *header;
@@ -12,6 +13,9 @@
 @property (nonatomic,strong) UIControl *searchControl;
 @property (nonatomic,strong) UIControl *notificationControl;
 @property (nonatomic,strong) UIControl *profileControl;
+@property (nonatomic,weak) UIView *nativeSearchView;
+@property (nonatomic,weak) UIView *nativeNotificationsView;
+@property (nonatomic,weak) UIView *nativeProfileView;
 @property (nonatomic,strong) NSArray<UIBarButtonItem *> *rightNavItems;
 @property (nonatomic,assign) NSInteger currentTab;
 @property (nonatomic,assign) BOOL scheduled;
@@ -85,27 +89,85 @@ __attribute__((constructor)) static void RTBootstrap(void) {
     }
     return nil;
 }
-- (void)activateBarItem:(UIBarButtonItem *)item {
-    if (item.target && item.action)
+// Route through the *original* Rutube navigation targets. Their Swift views often
+// use tap recognizers rather than UIKit UIControl target/action events.
+- (BOOL)dispatchRecognizer:(UIGestureRecognizer *)gesture {
+    if (!gesture.enabled || ![gesture isKindOfClass:UITapGestureRecognizer.class]) return NO;
+    @try {
+        NSArray *targets=[gesture valueForKey:@"_targets"];
+        if (![targets isKindOfClass:NSArray.class]) return NO;
+        for (id info in targets) {
+            Ivar ti=class_getInstanceVariable([info class], "_target");
+            Ivar ai=class_getInstanceVariable([info class], "_action");
+            if (!ti || !ai || strcmp(ivar_getTypeEncoding(ai),":")!=0) continue;
+            id target=object_getIvar(info,ti);
+            SEL action=*((SEL *)((uint8_t *)(__bridge void *)info+ivar_getOffset(ai)));
+            if (target && action && [target respondsToSelector:action]) {
+                [UIApplication.sharedApplication sendAction:action to:target from:gesture forEvent:nil];
+                return YES;
+            }
+        }
+    } @catch (__unused NSException *exception) {}
+    return NO;
+}
+- (BOOL)triggerOriginalView:(UIView *)view {
+    if (!view) return NO;
+    // Prefer the native button, retaining its own target and event semantics.
+    if ([view isKindOfClass:UIControl.class]) {
+        UIControl *control=(UIControl *)view;
+        if (control.enabled &&
+            ([control actionsForTarget:nil forControlEvent:UIControlEventTouchUpInside].count ||
+             control.allTargets.count || control.primaryAction)) {
+            [control sendActionsForControlEvents:UIControlEventTouchUpInside];
+            [control sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
+            return YES;
+        }
+    }
+    for (UIView *child in view.subviews)
+        if ([self triggerOriginalView:child]) return YES;
+    for (UIGestureRecognizer *gr in view.gestureRecognizers)
+        if ([self dispatchRecognizer:gr]) return YES;
+    return NO;
+}
+- (BOOL)activateBarItem:(UIBarButtonItem *)item {
+    if (!item) return NO;
+    if (item.target && item.action && [item.target respondsToSelector:item.action]) {
         [UIApplication.sharedApplication sendAction:item.action to:item.target from:item forEvent:nil];
-    else if (item.customView) [[self firstControl:item.customView] sendActionsForControlEvents:UIControlEventTouchUpInside];
+        return YES;
+    }
+    if (item.customView) return [self triggerOriginalView:item.customView];
+    return NO;
+}
+- (BOOL)routeOriginal:(NSString *)route {
+    if ([route isEqualToString:@"search"]) {
+        if ([self triggerOriginalView:self.nativeSearchView] ||
+            [self triggerOriginalView:self.searchControl]) return YES;
+        if (self.rightNavItems.count>=3)
+            return [self activateBarItem:self.rightNavItems[1]];
+    } else if ([route isEqualToString:@"notifications"]) {
+        if ([self triggerOriginalView:self.nativeNotificationsView] ||
+            [self triggerOriginalView:self.notificationControl]) return YES;
+        if (self.rightNavItems.count>=3)
+            return [self activateBarItem:self.rightNavItems[2]];
+    } else if ([route isEqualToString:@"profile"]) {
+        if ([self triggerOriginalView:self.nativeProfileView] ||
+            [self triggerOriginalView:self.profileControl]) return YES;
+        if (self.rightNavItems.count>=3)
+            return [self activateBarItem:self.rightNavItems[0]];
+    }
+    NSLog(@"[RTUIFix] Original %@ action unavailable. Original UI remains intact.",route);
+    return NO;
 }
 - (void)tapSearch {
-    if (self.searchControl) [self.searchControl sendActionsForControlEvents:UIControlEventTouchUpInside];
-    else if (self.rightNavItems.count>=4) [self activateBarItem:self.rightNavItems[1]];
-    else NSLog(@"[RTUIFix] No original search action found");
+    [self routeOriginal:@"search"];
     [self schedule];
 }
 - (void)tapNotifications {
-    if (self.notificationControl) [self.notificationControl sendActionsForControlEvents:UIControlEventTouchUpInside];
-    else if (self.rightNavItems.count>=4) [self activateBarItem:self.rightNavItems[2]];
-    else NSLog(@"[RTUIFix] No original notifications action found");
+    [self routeOriginal:@"notifications"];
     [self schedule];
 }
 - (void)tapProfile {
-    if (self.profileControl) [self.profileControl sendActionsForControlEvents:UIControlEventTouchUpInside];
-    else if (self.rightNavItems.count>=4) [self activateBarItem:self.rightNavItems[0]];
-    else [self activate:4];
+    if (![self routeOriginal:@"profile"]) [self activate:4];
 }
 - (void)tapHome { [self activate:0]; }
 - (void)tapUpload { [self activate:2]; }
@@ -160,41 +222,88 @@ __attribute__((constructor)) static void RTBootstrap(void) {
     self.nativeTabs=tabs;
 }
 - (void)captureOriginalHeader {
-    self.searchControl=nil;
-    self.notificationControl=nil;
-    self.profileControl=nil;
-    __block UINavigationBar *nav=nil;
-    [self walk:self.window with:^(UIView *v) {
+    UIWindow *w=self.window;
+    CGFloat top=w.safeAreaInsets.top;
+    NSMutableArray<UIView *> *originalIcons=[NSMutableArray array];
+    __block UINavigationBar *foundNav=nil;
+    [self walk:w with:^(UIView *v) {
         if (self.header && [v isDescendantOfView:self.header]) return;
         if (self.footer && [v isDescendantOfView:self.footer]) return;
-        CGRect r=[v convertRect:v.bounds toView:self.window];
-        if ([v isKindOfClass:UINavigationBar.class] && r.origin.y<180 && r.size.width>200) nav=(UINavigationBar *)v;
-        if (![v isKindOfClass:UIControl.class] || v.hidden || v.alpha<0.1 || r.origin.y>self.window.safeAreaInsets.top+125) return;
-        NSString *s=[NSString stringWithFormat:@"%@ %@",v.accessibilityLabel?:@"",v.accessibilityIdentifier?:@""].lowercaseString;
-        if (([s containsString:@"search"] || [s containsString:@"поиск"]) && !self.searchControl) self.searchControl=(UIControl *)v;
-        if (([s containsString:@"notification"] || [s containsString:@"уведом"]) && !self.notificationControl) self.notificationControl=(UIControl *)v;
-        if (([s containsString:@"profile"] || [s containsString:@"account"] || [s containsString:@"профил"]) && !self.profileControl) self.profileControl=(UIControl *)v;
+        CGRect rect=[v convertRect:v.bounds toView:w];
+        NSString *name=NSStringFromClass(v.class);
+        BOOL inHeader=(CGRectGetMidY(rect)>top-15 &&
+                       CGRectGetMidY(rect)<top+56 &&
+                       CGRectGetMidX(rect)>w.bounds.size.width*0.40);
+        if ([v isKindOfClass:UINavigationBar.class] && rect.origin.y<top+80 &&
+            rect.size.width>w.bounds.size.width*0.70)
+            foundNav=(UINavigationBar *)v;
+        if (inHeader && [name containsString:@"NavBarItemCustomView"] &&
+            !v.hidden && v.alpha>0.05)
+            [originalIcons addObject:v];
     }];
-    self.rightNavItems=nav.topItem.rightBarButtonItems;
+    // The native iOS top-right icons are physically ordered cast, bell,
+    // search, profile. Capture the exact original tappable views.
+    [originalIcons sortUsingComparator:^NSComparisonResult(UIView *a,UIView *b) {
+        CGFloat x=CGRectGetMidX([a convertRect:a.bounds toView:w]);
+        CGFloat y=CGRectGetMidX([b convertRect:b.bounds toView:w]);
+        return x<y?NSOrderedAscending:(x>y?NSOrderedDescending:NSOrderedSame);
+    }];
+    if (originalIcons.count>=3) {
+        self.nativeProfileView=originalIcons.lastObject;
+        self.nativeSearchView=originalIcons[originalIcons.count-2];
+        self.nativeNotificationsView=originalIcons[originalIcons.count-3];
+    }
+    // Rutube.RootTabBarController is a UITabBarController. Its selected
+    // navigation controller owns the actions on some app versions.
+    NSMutableArray<UIViewController *> *controllers=[NSMutableArray array];
+    UITabBarController *root=[self findTab:w.rootViewController];
+    if (root) {
+        [controllers addObject:root];
+        if (root.selectedViewController) [controllers addObject:root.selectedViewController];
+        if ([root.selectedViewController isKindOfClass:UINavigationController.class]) {
+            UINavigationController *nav=(UINavigationController *)root.selectedViewController;
+            if (nav.topViewController) [controllers addObject:nav.topViewController];
+        }
+    }
+    if (w.rootViewController) [controllers addObject:w.rootViewController];
+    if (foundNav.topItem.rightBarButtonItems.count>=3)
+        self.rightNavItems=foundNav.topItem.rightBarButtonItems;
+    for (UIViewController *vc in controllers)
+        if (vc.navigationItem.rightBarButtonItems.count>=3)
+            self.rightNavItems=vc.navigationItem.rightBarButtonItems;
+    // Last resort: actionable UIControls with explicit accessibility names.
+    [self walk:w with:^(UIView *v) {
+        if (self.header && [v isDescendantOfView:self.header]) return;
+        if (self.footer && [v isDescendantOfView:self.footer]) return;
+        CGRect r=[v convertRect:v.bounds toView:w];
+        if (![v isKindOfClass:UIControl.class] || v.hidden || v.alpha<0.05 ||
+            CGRectGetMidY(r)<top-15 || CGRectGetMidY(r)>top+56) return;
+        NSString *name=[NSString stringWithFormat:@"%@ %@",v.accessibilityLabel?:@"",v.accessibilityIdentifier?:@""].lowercaseString;
+        if (([name containsString:@"search"] || [name containsString:@"поиск"]) && !self.searchControl) self.searchControl=(UIControl *)v;
+        if (([name containsString:@"notification"] || [name containsString:@"уведом"]) && !self.notificationControl) self.notificationControl=(UIControl *)v;
+        if (([name containsString:@"profile"] || [name containsString:@"account"] || [name containsString:@"профил"]) && !self.profileControl) self.profileControl=(UIControl *)v;
+    }];
+    NSLog(@"[RTUIFix] Native header: %lu icon views, %lu nav actions",
+          (unsigned long)originalIcons.count,(unsigned long)self.rightNavItems.count);
 }
 - (void)drawHeader {
     UIWindow *w=self.window;
-    CGRect r=CGRectMake(0,w.safeAreaInsets.top,w.bounds.size.width,56);
+    CGRect r=CGRectMake(0,w.safeAreaInsets.top,w.bounds.size.width,44);
     if (!self.header) {
         self.header=[[UIView alloc] init];
-        self.header.backgroundColor=[UIColor colorWithRed:0.073 green:0.086 blue:0.107 alpha:1];
+        self.header.backgroundColor=[UIColor colorWithRed:0.105 green:0.125 blue:0.15 alpha:1];
     }
     self.header.frame=r;
     for (UIView *v in [self.header.subviews copy]) [v removeFromSuperview];
     UIButton *menu=[self button:@"line.3.horizontal" text:nil action:@selector(showMenu)
-                         frame:CGRectMake(8,0,48,56) active:NO];
+                         frame:CGRectMake(8,0,44,44) active:NO];
     [self.header addSubview:menu];
-    UILabel *logo=[[UILabel alloc] initWithFrame:CGRectMake(69,0,w.bounds.size.width-148,56)];
+    UILabel *logo=[[UILabel alloc] initWithFrame:CGRectMake(69,0,w.bounds.size.width-148,44)];
     logo.text=@"RUTUBE"; logo.font=[UIFont systemFontOfSize:26 weight:UIFontWeightHeavy];
     logo.textColor=UIColor.whiteColor;
     [self.header addSubview:logo];
     UIButton *profile=[self button:@"person" text:nil action:@selector(tapProfile)
-                           frame:CGRectMake(w.bounds.size.width-61,0,48,56) active:NO];
+                           frame:CGRectMake(w.bounds.size.width-56,0,44,44) active:NO];
     [self.header addSubview:profile];
     if (self.header.superview!=w) [w addSubview:self.header];
     [w bringSubviewToFront:self.header];
@@ -217,7 +326,7 @@ __attribute__((constructor)) static void RTBootstrap(void) {
     if (r.size.height<48 || r.size.height>170) return;
     if (!self.footer) {
         self.footer=[[UIView alloc] init];
-        self.footer.backgroundColor=[UIColor colorWithRed:0.07 green:0.08 blue:0.10 alpha:1];
+        self.footer.backgroundColor=[UIColor colorWithRed:0.105 green:0.12 blue:0.145 alpha:1];
     }
     self.footer.frame=r;
     for (UIView *v in [self.footer.subviews copy]) [v removeFromSuperview];
@@ -257,6 +366,8 @@ __attribute__((constructor)) static void RTBootstrap(void) {
     UIWindow *win=[self mainWindow];
     if (!win) return;
     self.window=win;
+    UITabBarController *activeTab=[self findTab:win.rootViewController];
+    if (activeTab) self.currentTab=activeTab.selectedIndex;
     UIView *native=[self findNativeBottom:win];
     if (!native) {
         self.header.hidden=YES;
